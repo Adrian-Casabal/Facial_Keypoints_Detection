@@ -1,18 +1,30 @@
-import pandas as pd
-import torch
-from torch.utils.data import DataLoader
-import torch.optim as optim
-from sklearn.model_selection import train_test_split
-from tqdm import tqdm
+import random
 from pathlib import Path
 
+import pandas as pd
+import torch
+import torch.nn.functional as F
+import torch.optim as optim
+from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+from config import BATCH_SIZE, EPOCHS, LR, NUM_WORKERS, SEED, VAL_SIZE, WEIGHT_DECAY
 from dataset import FacialKeypointsDataset
 from model import KeypointCNN
 
-def masked_mse_loss(pred, target, mask):
-    diff = (pred - target) ** 2
+
+def seed_everything(seed):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def masked_smooth_l1_loss(pred, target, mask, beta=0.05):
+    diff = F.smooth_l1_loss(pred, target, reduction="none", beta=beta)
     diff = diff * mask
-    return diff.sum() / mask.sum()
+    return diff.sum() / mask.sum().clamp_min(1.0)
+
 
 def main():
     src_dir = Path(__file__).resolve().parent
@@ -24,6 +36,7 @@ def main():
     if not train_csv.exists():
         raise FileNotFoundError(f"Training data not found at: {train_csv}")
 
+    seed_everything(SEED)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -39,49 +52,92 @@ def main():
     print("=======================\n")
 
     train_df = pd.read_csv(train_csv)
-    train_df, val_df = train_test_split(train_df, test_size=0.1, random_state=42)
+    train_df, val_df = train_test_split(train_df, test_size=VAL_SIZE, random_state=SEED)
 
-    train_ds = FacialKeypointsDataset(train_df, train=True)
-    val_ds = FacialKeypointsDataset(val_df, train=True)
+    train_ds = FacialKeypointsDataset(train_df, train=True, augment=True)
+    val_ds = FacialKeypointsDataset(val_df, train=True, augment=False)
 
-    train_loader = DataLoader(train_ds, batch_size=64, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=64, shuffle=False)
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=NUM_WORKERS,
+        pin_memory=device.type == "cuda",
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=device.type == "cuda",
+    )
 
     model = KeypointCNN().to(device)
-    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=0.5,
+        patience=4,
+        min_lr=1e-5,
+    )
 
     best_val = float("inf")
+    epochs_without_improvement = 0
 
-    for epoch in range(25):
+    for epoch in range(EPOCHS):
         model.train()
-        train_loss = 0
+        train_loss = 0.0
 
-        for imgs, targets, masks in tqdm(train_loader):
-            imgs, targets, masks = imgs.to(device), targets.to(device), masks.to(device)
+        progress = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{EPOCHS}", leave=False)
+
+        for imgs, targets, masks in progress:
+            imgs = imgs.to(device)
+            targets = targets.to(device)
+            masks = masks.to(device)
 
             optimizer.zero_grad()
             preds = model(imgs)
-            loss = masked_mse_loss(preds, targets, masks)
+            loss = masked_smooth_l1_loss(preds, targets, masks)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
             train_loss += loss.item()
+            progress.set_postfix(loss=f"{loss.item():.4f}")
 
         model.eval()
-        val_loss = 0
+        val_loss = 0.0
 
         with torch.no_grad():
             for imgs, targets, masks in val_loader:
-                imgs, targets, masks = imgs.to(device), targets.to(device), masks.to(device)
+                imgs = imgs.to(device)
+                targets = targets.to(device)
+                masks = masks.to(device)
+
                 preds = model(imgs)
-                loss = masked_mse_loss(preds, targets, masks)
+                loss = masked_smooth_l1_loss(preds, targets, masks)
                 val_loss += loss.item()
 
-        print(f"Epoch {epoch+1}: train={train_loss:.4f}, val={val_loss:.4f}")
+        train_loss /= max(len(train_loader), 1)
+        val_loss /= max(len(val_loader), 1)
+        scheduler.step(val_loss)
+
+        current_lr = optimizer.param_groups[0]["lr"]
+        print(f"Epoch {epoch + 1}: train={train_loss:.4f}, val={val_loss:.4f}, lr={current_lr:.6f}")
 
         if val_loss < best_val:
             best_val = val_loss
             torch.save(model.state_dict(), model_path)
+            epochs_without_improvement = 0
+            print(f"Saved improved model to {model_path}")
+        else:
+            epochs_without_improvement += 1
+
+        if epochs_without_improvement >= 12:
+            print("Early stopping triggered.")
+            break
+
 
 if __name__ == "__main__":
     main()
