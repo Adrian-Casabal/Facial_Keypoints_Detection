@@ -9,7 +9,7 @@ from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from config import BATCH_SIZE, EPOCHS, LR, NUM_WORKERS, SEED, VAL_SIZE, WEIGHT_DECAY
+from config import BACKBONE_LR, BATCH_SIZE, EPOCHS, HEAD_LR, NUM_WORKERS, SEED, VAL_SIZE, WEIGHT_DECAY
 from dataset import FacialKeypointsDataset
 from model import KeypointCNN
 
@@ -72,14 +72,26 @@ def main():
         pin_memory=device.type == "cuda",
     )
 
-    model = KeypointCNN().to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    model = KeypointCNN(pretrained=True).to(device)
+    optimizer = optim.AdamW(
+        [
+            {"params": model.backbone_parameters(), "lr": BACKBONE_LR},
+            {"params": model.head_parameters(), "lr": HEAD_LR},
+        ],
+        weight_decay=WEIGHT_DECAY,
+    )
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode="min",
         factor=0.5,
         patience=4,
         min_lr=1e-5,
+    )
+
+    print(
+        "Backbone: HRNet-W18 | "
+        f"pretrained_weights_loaded={model.using_pretrained_weights} | "
+        f"backbone_lr={BACKBONE_LR} | head_lr={HEAD_LR}"
     )
 
     best_val = float("inf")
@@ -123,8 +135,12 @@ def main():
         val_loss /= max(len(val_loader), 1)
         scheduler.step(val_loss)
 
-        current_lr = optimizer.param_groups[0]["lr"]
-        print(f"Epoch {epoch + 1}: train={train_loss:.4f}, val={val_loss:.4f}, lr={current_lr:.6f}")
+        backbone_lr = optimizer.param_groups[0]["lr"]
+        head_lr = optimizer.param_groups[1]["lr"]
+        print(
+            f"Epoch {epoch + 1}: train={train_loss:.4f}, val={val_loss:.4f}, "
+            f"backbone_lr={backbone_lr:.6f}, head_lr={head_lr:.6f}"
+        )
 
         if val_loss < best_val:
             best_val = val_loss

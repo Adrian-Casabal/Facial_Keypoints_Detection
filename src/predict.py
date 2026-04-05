@@ -36,7 +36,7 @@ def main():
         pin_memory=device.type == "cuda",
     )
 
-    model = KeypointCNN().to(device)
+    model = KeypointCNN(pretrained=False).to(device)
     try:
         state_dict = torch.load(model_path, map_location=device)
         model.load_state_dict(state_dict)
